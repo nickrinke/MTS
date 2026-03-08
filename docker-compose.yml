@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  mts:
+    build: .
+    container_name: mts
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - mts-data:/data
+    environment:
+      - MTS_DB_PATH=/data/mts.db
+      - TZ=UTC
+
+volumes:
+  mts-data:
