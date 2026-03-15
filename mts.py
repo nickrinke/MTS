@@ -1,5 +1,5 @@
 """
-MTS — Monitor The Situation (v2)
+MTS — Monitor The Situation (v3)
 =================================
 Watches geopolitical news, macro markets, and crypto 24/7.
 Uses Claude to score events. Fires Discord alerts only when
@@ -38,10 +38,11 @@ ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 FRED_API_KEY        = os.getenv("FRED_API_KEY", "")
 SCAN_HOURS_BACK     = int(os.getenv("SCAN_HOURS_BACK", "4"))
-SIGNAL_THRESHOLD    = int(os.getenv("SIGNAL_THRESHOLD", "7"))
+SIGNAL_THRESHOLD    = int(os.getenv("SIGNAL_THRESHOLD", "8"))
 DB_PATH             = os.getenv("MTS_DB_PATH", "/data/mts.db")
 WEEKLY_REPORT_DAY   = int(os.getenv("WEEKLY_REPORT_DAY", "6"))  # 0=Mon, 6=Sun
-DEDUP_SIMILARITY    = float(os.getenv("DEDUP_SIMILARITY", "0.70"))
+DEDUP_SIMILARITY    = float(os.getenv("DEDUP_SIMILARITY", "0.50"))
+CRYPTO_ENABLED      = os.getenv("CRYPTO_ENABLED", "true").lower() in ("true", "1", "yes")
 
 WATCHLIST = {
     "Oil":           "USO",
@@ -223,22 +224,49 @@ def log_signal(conn: sqlite3.Connection, scan_type: str, analysis: dict) -> int:
     return cur.lastrowid
 
 
-def _parse_price(s: str) -> float | None:
-    """Extract first dollar amount from a string like '$81.50 - $82.00'."""
+def _parse_price(s: str, label: str = "") -> float | None:
+    """Extract price from a string. Uses midpoint for ranges like '$81.50 - $82.00'."""
     if not s:
         return None
     cleaned = str(s).replace(",", "")
-    match = re.search(r"\$?([\d]+\.?\d*)", cleaned)
-    return float(match.group(1)) if match else None
+    # Try to find a range first (e.g. "$81.50 - $82.00")
+    range_match = re.findall(r"\$?([\d]+\.?\d*)", cleaned)
+    if len(range_match) >= 2:
+        try:
+            low = float(range_match[0])
+            high = float(range_match[1])
+            # Sanity: if second number looks like a percentage (e.g. "+6%"), skip it
+            if high > low * 3:
+                result = low
+            else:
+                result = round((low + high) / 2, 2)
+            return result
+        except ValueError:
+            pass
+    if range_match:
+        try:
+            return float(range_match[0])
+        except ValueError:
+            pass
+    if label:
+        print(f"  [PARSE] Could not parse price from '{s}' ({label})")
+    return None
 
 
-def _parse_int(s) -> int | None:
+def _parse_int(s, label: str = "") -> int | None:
     if isinstance(s, int):
         return s
     if isinstance(s, str):
         match = re.search(r"(\d+)", s)
-        return int(match.group(1)) if match else None
+        if match:
+            return int(match.group(1))
+    if label and s:
+        print(f"  [PARSE] Could not parse int from '{s}' ({label})")
     return None
+
+
+MAX_STALE_DAYS = 7  # Force-expire any signal older than this
+MAX_REASONABLE_PNL = 30.0  # Reject P&L calculations above ±30%
 
 
 def check_open_signals(conn: sqlite3.Connection) -> None:
@@ -263,6 +291,20 @@ def check_open_signals(conn: sqlite3.Connection) -> None:
         if not instrument:
             continue
 
+        signal_date = datetime.fromisoformat(sig["timestamp"])
+        now = datetime.now(timezone.utc)
+        days_open = (now - signal_date).days
+
+        # Force-expire anything older than MAX_STALE_DAYS regardless
+        if days_open > MAX_STALE_DAYS:
+            conn.execute(
+                """UPDATE signals SET outcome = ?, outcome_date = ? WHERE id = ?""",
+                ("EXPIRED", now.isoformat(), sig["id"]),
+            )
+            conn.commit()
+            print(f"  ⏰ {instrument} {sig['direction']} → EXPIRED (stale, {days_open}d open)")
+            continue
+
         ticker = crypto_map.get(instrument.upper(), instrument)
 
         try:
@@ -274,18 +316,16 @@ def check_open_signals(conn: sqlite3.Connection) -> None:
             print(f"  [OUTCOMES] Error fetching {ticker}: {e}")
             continue
 
-        target_price = _parse_price(sig["target"])
-        stop_price = _parse_price(sig["stop_loss"])
+        target_price = _parse_price(sig["target"], f"{instrument} target")
+        stop_price = _parse_price(sig["stop_loss"], f"{instrument} stop")
         direction = sig["direction"]
-        entry_price = _parse_price(sig["entry_zone"])
+        entry_price = _parse_price(sig["entry_zone"], f"{instrument} entry")
         max_days = sig["max_hold_days"]
-        signal_date = datetime.fromisoformat(sig["timestamp"])
-        now = datetime.now(timezone.utc)
 
         outcome = None
         outcome_pnl = None
 
-        if max_days and (now - signal_date).days > max_days:
+        if max_days and days_open > max_days:
             outcome = "EXPIRED"
         elif direction == "LONG":
             if target_price and price >= target_price:
@@ -305,6 +345,11 @@ def check_open_signals(conn: sqlite3.Connection) -> None:
                 else:
                     outcome_pnl = round(((entry_price - price) / entry_price) * 100, 2)
 
+                # Sanity check: reject obviously wrong P&L
+                if outcome_pnl is not None and abs(outcome_pnl) > MAX_REASONABLE_PNL:
+                    print(f"  ⚠️ {instrument} {direction} → {outcome} but P&L {outcome_pnl}% looks wrong (entry={sig['entry_zone']}, target={sig['target']}, price=${price:.2f}) — recording as UNKNOWN")
+                    outcome_pnl = None
+
             conn.execute(
                 """UPDATE signals SET outcome = ?, outcome_price = ?,
                    outcome_date = ?, outcome_pnl_pct = ? WHERE id = ?""",
@@ -318,8 +363,28 @@ def check_open_signals(conn: sqlite3.Connection) -> None:
 
 # ── Alert Deduplication ──────────────────────────────────────────────────────
 
-def is_duplicate_alert(conn: sqlite3.Connection, scan_type: str, event_summary: str) -> bool:
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+def is_duplicate_alert(conn: sqlite3.Connection, scan_type: str, event_summary: str,
+                       instrument: str = "") -> bool:
+    """
+    Check if a similar alert was fired recently.
+    Two layers:
+      1. Instrument cooldown — same ticker/coin can't alert again within DEDUP window
+      2. Summary similarity — catches rephrased versions of the same thesis
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+
+    # Layer 1: instrument cooldown — if we alerted on this instrument recently, block it
+    if instrument:
+        instrument_match = conn.execute(
+            """SELECT id FROM signals
+               WHERE scan_type = ? AND instrument = ? AND timestamp > ?
+               ORDER BY id DESC LIMIT 1""",
+            (scan_type, instrument, cutoff),
+        ).fetchone()
+        if instrument_match:
+            return True
+
+    # Layer 2: summary similarity
     recent = conn.execute(
         """SELECT event_summary FROM alert_log
            WHERE scan_type = ? AND timestamp > ?
@@ -696,23 +761,24 @@ def format_fred_data(fred: dict) -> str:
 
 # ── Adaptive Threshold ───────────────────────────────────────────────────────
 
-def compute_adaptive_threshold(market: dict, base_threshold: int = 7) -> int:
+def compute_adaptive_threshold(market: dict, base_threshold: int = 8) -> int:
     """
     Adjust signal threshold based on VIX.
     High vol → lower threshold (more sensitive during crises).
     Low vol → higher threshold (filter noise during quiet periods).
+    Base 8: crisis → 6, elevated → 7, normal → 8, calm → 9, dead → 10
     """
     vix_data = market.get("Volatility", {})
     vix_price = vix_data.get("price", 20)
 
     if vix_price >= 30:
-        return max(base_threshold - 2, 4)
+        return max(base_threshold - 2, 6)
     elif vix_price >= 25:
-        return max(base_threshold - 1, 5)
+        return max(base_threshold - 1, 7)
     elif vix_price <= 14:
-        return min(base_threshold + 2, 9)
+        return min(base_threshold + 2, 10)
     elif vix_price <= 17:
-        return min(base_threshold + 1, 8)
+        return min(base_threshold + 1, 9)
     else:
         return base_threshold
 
@@ -729,6 +795,7 @@ You think like a seasoned hedge fund analyst:
 - You are conservative — most news does NOT warrant a trade
 - You only flag a signal when the setup is genuinely compelling
 - You wait for events that create obvious, directional macro moves
+- You design trades for quick in-and-out execution — 1 to 7 days max, never longer
 - You track developing situations across scans (previous scan context is provided)
 - You factor in upcoming economic events (FOMC, CPI, NFP) when assessing risk and timing
 - You note when a signal is the same as a previous scan (avoid re-alerting on stale events)
@@ -793,8 +860,8 @@ Analyze the above and return a JSON object with this exact structure:
     "entry_zone": "Price range to enter, e.g. $81.50 - $82.00",
     "target": "Price target to take profit, e.g. $87.00 (+6%)",
     "stop_loss": "Price to exit if wrong, e.g. $79.50 (-3%)",
-    "max_hold_days": "Exit after this many days regardless, e.g. 7",
-    "timeframe": "e.g. 3-7 days, 2-4 weeks",
+    "max_hold_days": "Exit after this many days regardless. MAXIMUM 7 days — this system is for quick trades only.",
+    "timeframe": "e.g. 1-3 days, 3-5 days, 5-7 days (never longer than 7 days)",
     "entry_note": "Any timing or entry guidance",
     "exit_note": "Conditions that should trigger early exit before target or stop",
     "invalidation": "What would make this thesis wrong"
@@ -808,6 +875,7 @@ If no compelling signal exists, set signal_detected to false and confidence_scor
 The trade object should still be filled with your best assessment even if no signal.
 Be specific with entry_zone, target, and stop_loss — use actual price levels based on current market data.
 If this event is substantially the same as a previous scan, set is_repeat_of_previous to true.
+max_hold_days must NEVER exceed 7. This system is designed for quick in-and-out trades only.
 """
 
     response = client.messages.create(
@@ -822,10 +890,14 @@ If this event is substantially the same as a previous scan, set is_repeat_of_pre
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
-    return json.loads(raw.strip())
-
-
-# ── Claude Analysis — Crypto ─────────────────────────────────────────────────
+    try:
+        return json.loads(raw.strip())
+    except json.JSONDecodeError as e:
+        print(f"  [MACRO] JSON parse error: {e}")
+        print(f"  [MACRO] Raw response: {raw[:500]}")
+        return {"signal_detected": False, "confidence_score": 0,
+                "event_summary": "Analysis failed — Claude returned invalid JSON",
+                "thesis": "", "trade": {}, "risk_level": "LOW"}
 
 CRYPTO_SYSTEM_PROMPT = """You are a crypto market analyst inside a system called MTS (Monitor The Situation).
 Your job is to evaluate crypto-specific signals — price action, sentiment, news, fear/greed —
@@ -898,7 +970,7 @@ Analyze the above and return a JSON object with this exact structure:
     "entry_zone": "Price range to enter, e.g. $82,000 - $83,500",
     "target": "Price target to take profit, e.g. $91,000 (+10%)",
     "stop_loss": "Price to exit if wrong, e.g. $78,000 (-5%)",
-    "max_hold_days": "Exit after this many days regardless, e.g. 5",
+    "max_hold_days": "Exit after this many days regardless. MAXIMUM 7 days — this system is for quick trades only.",
     "entry_note": "Any timing or entry guidance",
     "exit_note": "Conditions that should trigger early exit before target or stop",
     "invalidation": "What would make this thesis wrong"
@@ -910,6 +982,7 @@ Analyze the above and return a JSON object with this exact structure:
 If no compelling signal exists, set signal_detected to false and confidence_score below 5.
 Be specific with entry_zone, target, and stop_loss — use actual price levels from the data provided.
 If this event is substantially the same as a previous scan, set is_repeat_of_previous to true.
+max_hold_days must NEVER exceed 7. This system is designed for quick in-and-out trades only.
 """
 
     response = client.messages.create(
@@ -924,7 +997,14 @@ If this event is substantially the same as a previous scan, set is_repeat_of_pre
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
-    return json.loads(raw.strip())
+    try:
+        return json.loads(raw.strip())
+    except json.JSONDecodeError as e:
+        print(f"  [CRYPTO] JSON parse error: {e}")
+        print(f"  [CRYPTO] Raw response: {raw[:500]}")
+        return {"signal_detected": False, "confidence_score": 0,
+                "event_summary": "Analysis failed — Claude returned invalid JSON",
+                "thesis": "", "trade": {}, "risk_level": "LOW"}
 
 
 # ── Discord Alerts ───────────────────────────────────────────────────────────
@@ -987,17 +1067,28 @@ def send_crypto_alert(analysis: dict) -> None:
     print("  [Discord] Crypto alert sent.")
 
 
-def send_heartbeat(macro_analysis: dict, crypto_analysis: dict, threshold: int) -> None:
+def send_heartbeat(conn: sqlite3.Connection, macro_analysis: dict, crypto_analysis: dict, threshold: int) -> None:
+    """Send a quiet heartbeat — max once per day."""
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    existing = conn.execute(
+        "SELECT id FROM alert_log WHERE scan_type = 'heartbeat' AND timestamp LIKE ?",
+        (f"{today_str}%",),
+    ).fetchone()
+    if existing:
+        return
+
     macro_score = macro_analysis.get("confidence_score", 0)
     crypto_score = crypto_analysis.get("confidence_score", 0)
 
+    crypto_line = f" • Crypto: {crypto_score}/10" if CRYPTO_ENABLED else ""
     content = (
         f"💤 MTS scanned — no signals above threshold ({threshold}/10)\n"
-        f"Macro: {macro_score}/10 • Crypto: {crypto_score}/10\n"
+        f"Macro: {macro_score}/10{crypto_line}\n"
         f"-# {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10).raise_for_status()
+        log_alert(conn, "heartbeat", f"Heartbeat {today_str}")
     except Exception:
         pass
 
@@ -1071,8 +1162,15 @@ Avg confidence — winners: {avg_conf_winners}/10, losers: {avg_conf_losers}/10
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=500,
-            system="You write brief, punchy weekly trading recaps for Discord. Keep it under 800 characters. No markdown. Use plain text with line breaks.",
-            messages=[{"role": "user", "content": f"Write a weekly MTS performance recap based on these stats:\n{stats_text}\nKeep it conversational and honest. If performance was bad, say so. If good, note what worked."}],
+            system="""You write brief, brutally honest weekly trading system recaps for Discord. Keep it under 800 characters. No markdown. Use plain text with line breaks.
+
+Rules:
+- Be skeptical of the data. If P&L numbers look unrealistic (e.g. +50% on an ETF in a week), call it out as likely a data/parsing error.
+- If the sample size is small (fewer than 10 resolved signals), say the hit rate is not yet meaningful.
+- If most signals are still open, note that the system may be generating signals faster than they resolve.
+- Never hype performance. If you're not sure the numbers are reliable, say so.
+- Focus on what needs to improve, not what looks good.""",
+            messages=[{"role": "user", "content": f"Write a weekly MTS performance recap based on these stats:\n{stats_text}"}],
         )
         narrative = response.content[0].text.strip()
     except Exception as e:
@@ -1168,8 +1266,9 @@ def main():
     macro_fired = False
     if macro_detected and macro_score >= threshold and not is_repeat:
         event_summary = macro_analysis.get("event_summary", "")
-        if is_duplicate_alert(conn, "macro", event_summary):
-            print("  ⚡ Deduplicated — similar alert sent recently.")
+        macro_instrument = macro_analysis.get("trade", {}).get("instrument", "")
+        if is_duplicate_alert(conn, "macro", event_summary, macro_instrument):
+            print("  ⚡ Deduplicated — similar alert or same instrument recently.")
         else:
             print("  🚨 Alerting Discord...")
             send_macro_alert(macro_analysis)
@@ -1180,49 +1279,54 @@ def main():
         print("  ✓ No macro signal.")
 
     # ── Crypto ──
-    print("\n[CRYPTO]")
-    print("  Fetching crypto headlines...")
-    crypto_headlines = fetch_headlines("crypto")
-    print(f"  Total: {len(crypto_headlines)} articles.")
-
-    print("  Fetching crypto prices...")
-    crypto = fetch_crypto_snapshot()
-    print(f"  {len(crypto)} coins.")
-
-    print("  Fetching fear & greed...")
-    fear_greed = fetch_crypto_fear_greed()
-    if fear_greed:
-        print(f"  Fear & Greed: {fear_greed['value']} ({fear_greed['classification']})")
-
-    crypto_memory = get_recent_memory(conn, "crypto", n=5)
-
-    print("  Claude analysis...")
-    crypto_analysis = analyze_crypto(crypto_headlines, crypto, fear_greed, crypto_memory)
-    crypto_score    = crypto_analysis.get("confidence_score", 0)
-    crypto_detected = crypto_analysis.get("signal_detected", False)
-    crypto_repeat   = crypto_analysis.get("is_repeat_of_previous", False)
-    print(f"  Signal: {crypto_detected} | Score: {crypto_score}/10 | Repeat: {crypto_repeat}")
-    print(f"  {crypto_analysis.get('event_summary', 'N/A')}")
-
-    store_scan_memory(conn, "crypto", crypto_analysis)
-
     crypto_fired = False
-    if crypto_detected and crypto_score >= threshold and not crypto_repeat:
-        event_summary = crypto_analysis.get("event_summary", "")
-        if is_duplicate_alert(conn, "crypto", event_summary):
-            print("  ⚡ Deduplicated — similar alert sent recently.")
+    crypto_analysis = {"confidence_score": 0}
+    if CRYPTO_ENABLED:
+        print("\n[CRYPTO]")
+        print("  Fetching crypto headlines...")
+        crypto_headlines = fetch_headlines("crypto")
+        print(f"  Total: {len(crypto_headlines)} articles.")
+
+        print("  Fetching crypto prices...")
+        crypto = fetch_crypto_snapshot()
+        print(f"  {len(crypto)} coins.")
+
+        print("  Fetching fear & greed...")
+        fear_greed = fetch_crypto_fear_greed()
+        if fear_greed:
+            print(f"  Fear & Greed: {fear_greed['value']} ({fear_greed['classification']})")
+
+        crypto_memory = get_recent_memory(conn, "crypto", n=5)
+
+        print("  Claude analysis...")
+        crypto_analysis = analyze_crypto(crypto_headlines, crypto, fear_greed, crypto_memory)
+        crypto_score    = crypto_analysis.get("confidence_score", 0)
+        crypto_detected = crypto_analysis.get("signal_detected", False)
+        crypto_repeat   = crypto_analysis.get("is_repeat_of_previous", False)
+        print(f"  Signal: {crypto_detected} | Score: {crypto_score}/10 | Repeat: {crypto_repeat}")
+        print(f"  {crypto_analysis.get('event_summary', 'N/A')}")
+
+        store_scan_memory(conn, "crypto", crypto_analysis)
+
+        if crypto_detected and crypto_score >= threshold and not crypto_repeat:
+            event_summary = crypto_analysis.get("event_summary", "")
+            crypto_instrument = crypto_analysis.get("trade", {}).get("coin", "")
+            if is_duplicate_alert(conn, "crypto", event_summary, crypto_instrument):
+                print("  ⚡ Deduplicated — similar alert or same coin recently.")
+            else:
+                print("  🚨 Alerting Discord...")
+                send_crypto_alert(crypto_analysis)
+                log_alert(conn, "crypto", event_summary)
+                log_signal(conn, "crypto", crypto_analysis)
+                crypto_fired = True
         else:
-            print("  🚨 Alerting Discord...")
-            send_crypto_alert(crypto_analysis)
-            log_alert(conn, "crypto", event_summary)
-            log_signal(conn, "crypto", crypto_analysis)
-            crypto_fired = True
+            print("  ✓ No crypto signal.")
     else:
-        print("  ✓ No crypto signal.")
+        print("\n[CRYPTO] Disabled.")
 
     # ── Heartbeat ──
     if not macro_fired and not crypto_fired:
-        send_heartbeat(macro_analysis, crypto_analysis, threshold)
+        send_heartbeat(conn, macro_analysis, crypto_analysis, threshold)
 
     conn.close()
     print("\nDone.\n")

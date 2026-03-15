@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   mts:
     build: .
@@ -12,6 +10,17 @@ services:
     environment:
       - MTS_DB_PATH=/data/mts.db
       - TZ=UTC
+
+  dashboard:
+    build: ./dashboard
+    container_name: mts-dashboard
+    restart: unless-stopped
+    ports:
+      - "8070:8080"
+    volumes:
+      - mts-data:/data
+    environment:
+      - MTS_DB_PATH=/data/mts.db
 
 volumes:
   mts-data:
