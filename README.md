@@ -12,6 +12,8 @@ AI-powered geopolitical and crypto market scanner. Uses Claude to score events a
 - Deduplicates alerts so the same event doesn't spam Discord across scans
 - Includes a self-hosted dashboard for monitoring signals, scan history, headlines, and performance
 
+![MTS Dashboard](dashboard.png)
+
 ## Features
 
 | Feature | Description |
